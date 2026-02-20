@@ -5,14 +5,33 @@ Every tool description is the sole source of context for Claude on mobile.
 Descriptions must be thorough enough that Claude can operate without CLAUDE.md.
 """
 
+import logging
 import os
+import traceback
+
 from dotenv import load_dotenv
 from fastmcp import FastMCP
 from supabase import create_client
 
 load_dotenv()
 
+# ---------------------------------------------------------------------------
+# Logging setup — logs to file + console so we can diagnose mobile issues
+# ---------------------------------------------------------------------------
+LOG_FILE = os.path.join(os.path.dirname(__file__), "..", "server.log")
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOG_FILE, encoding="utf-8"),
+        logging.StreamHandler(),
+    ],
+)
+log = logging.getLogger("second-brain")
+
+log.info("Connecting to Supabase...")
 supabase = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_ANON_KEY"])
+log.info("Supabase client ready")
 
 CATEGORIES = [
     "groceries",
@@ -52,6 +71,7 @@ def get_system_info() -> dict:
 
     CALL THIS FIRST in any new conversation to orient yourself before doing anything else.
     """
+    log.info("TOOL CALL: get_system_info()")
     return {
         "categories": {
             "groceries": "Shopping lists, meal-prep ingredients, household supplies",
@@ -102,20 +122,27 @@ def add_idea(
 
     Returns the saved idea with its generated UUID.
     """
-    return (
-        supabase.table("ideas")
-        .insert(
-            {
-                "title": title,
-                "content": content,
-                "category": category,
-                "tags": tags or [],
-                "metadata": metadata or {},
-            }
+    log.info("TOOL CALL: add_idea(title=%r, category=%r, tags=%r)", title, category, tags)
+    try:
+        result = (
+            supabase.table("ideas")
+            .insert(
+                {
+                    "title": title,
+                    "content": content,
+                    "category": category,
+                    "tags": tags or [],
+                    "metadata": metadata or {},
+                }
+            )
+            .execute()
+            .data[0]
         )
-        .execute()
-        .data[0]
-    )
+        log.info("  -> saved idea %s", result.get("id"))
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
@@ -132,20 +159,40 @@ def search_ideas(
 
     Returns a list of matching ideas (most recent first, max 25).
     """
-    q = supabase.table("ideas").select("*").eq("is_archived", False)
-    if category:
-        q = q.eq("category", category)
-    if tags:
-        q = q.overlaps("tags", tags)
-    if query:
-        q = q.text_search("content", query)
-    return q.order("created_at", desc=True).limit(25).execute().data
+    log.info("TOOL CALL: search_ideas(query=%r, category=%r, tags=%r)", query, category, tags)
+    try:
+        q = supabase.table("ideas").select("*").eq("is_archived", False)
+        if category:
+            q = q.eq("category", category)
+        if tags:
+            q = q.overlaps("tags", tags)
+        if query:
+            # text_search returns a different builder that doesn't support .order()/.limit()
+            # so we apply ordering and limit before text_search, or just execute after it
+            results = q.text_search("content", query).execute().data
+            # Sort and limit in Python since the builder doesn't chain
+            results.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+            results = results[:25]
+        else:
+            results = q.order("created_at", desc=True).limit(25).execute().data
+        log.info("  -> returned %d ideas", len(results))
+        return results
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
 def get_idea(idea_id: str) -> dict:
     """Retrieve a single idea by its UUID. Use when you need full detail on a specific note."""
-    return supabase.table("ideas").select("*").eq("id", idea_id).execute().data[0]
+    log.info("TOOL CALL: get_idea(id=%r)", idea_id)
+    try:
+        result = supabase.table("ideas").select("*").eq("id", idea_id).execute().data[0]
+        log.info("  -> found: %r", result.get("title"))
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
@@ -154,7 +201,14 @@ def update_idea(idea_id: str, fields: dict) -> dict:
 
     Updatable fields: title, content, category (must be one of: groceries, religious_study, finance_journal, product_ideas, health_wellness, cf_care, cooking_recipes, business_learning), tags, metadata.
     """
-    return supabase.table("ideas").update(fields).eq("id", idea_id).execute().data[0]
+    log.info("TOOL CALL: update_idea(id=%r, fields=%r)", idea_id, list(fields.keys()))
+    try:
+        result = supabase.table("ideas").update(fields).eq("id", idea_id).execute().data[0]
+        log.info("  -> updated idea %s", idea_id)
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
@@ -163,28 +217,42 @@ def list_by_category(category: str, limit: int = 20) -> list:
 
     category MUST be one of: groceries, religious_study, finance_journal, product_ideas, health_wellness, cf_care, cooking_recipes, business_learning
     """
-    return (
-        supabase.table("ideas")
-        .select("*")
-        .eq("category", category)
-        .eq("is_archived", False)
-        .order("created_at", desc=True)
-        .limit(limit)
-        .execute()
-        .data
-    )
+    log.info("TOOL CALL: list_by_category(category=%r, limit=%d)", category, limit)
+    try:
+        results = (
+            supabase.table("ideas")
+            .select("*")
+            .eq("category", category)
+            .eq("is_archived", False)
+            .order("created_at", desc=True)
+            .limit(limit)
+            .execute()
+            .data
+        )
+        log.info("  -> returned %d ideas", len(results))
+        return results
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
 def archive_idea(idea_id: str) -> dict:
     """Soft-delete an idea by marking it archived. It won't appear in searches."""
-    return (
-        supabase.table("ideas")
-        .update({"is_archived": True})
-        .eq("id", idea_id)
-        .execute()
-        .data[0]
-    )
+    log.info("TOOL CALL: archive_idea(id=%r)", idea_id)
+    try:
+        result = (
+            supabase.table("ideas")
+            .update({"is_archived": True})
+            .eq("id", idea_id)
+            .execute()
+            .data[0]
+        )
+        log.info("  -> archived idea %s", idea_id)
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -198,12 +266,19 @@ def add_topic(name: str, description: str = "", category: str | None = None) -> 
 
     category (optional): one of groceries, religious_study, finance_journal, product_ideas, health_wellness, cf_care, cooking_recipes, business_learning
     """
-    data = {"name": name}
-    if description:
-        data["description"] = description
-    if category:
-        data["category"] = category
-    return supabase.table("topics").insert(data).execute().data[0]
+    log.info("TOOL CALL: add_topic(name=%r, category=%r)", name, category)
+    try:
+        data = {"name": name}
+        if description:
+            data["description"] = description
+        if category:
+            data["category"] = category
+        result = supabase.table("topics").insert(data).execute().data[0]
+        log.info("  -> created topic %s", result.get("id"))
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
@@ -211,22 +286,36 @@ def list_topics(category: str | None = None) -> list:
     """List all registered topics, optionally filtered by category (groceries, religious_study, finance_journal, product_ideas, health_wellness, cf_care, cooking_recipes, business_learning).
     Useful for suggesting tags when capturing new ideas.
     """
-    q = supabase.table("topics").select("*")
-    if category:
-        q = q.eq("category", category)
-    return q.order("name").execute().data
+    log.info("TOOL CALL: list_topics(category=%r)", category)
+    try:
+        q = supabase.table("topics").select("*")
+        if category:
+            q = q.eq("category", category)
+        results = q.order("name").execute().data
+        log.info("  -> returned %d topics", len(results))
+        return results
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
 def search_topics(query: str) -> list:
     """Search topics by partial name match. Use for tag autocomplete."""
-    return (
-        supabase.table("topics")
-        .select("*")
-        .ilike("name", f"%{query}%")
-        .execute()
-        .data
-    )
+    log.info("TOOL CALL: search_topics(query=%r)", query)
+    try:
+        results = (
+            supabase.table("topics")
+            .select("*")
+            .ilike("name", f"%{query}%")
+            .execute()
+            .data
+        )
+        log.info("  -> returned %d topics", len(results))
+        return results
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -246,19 +335,26 @@ def link_ideas(
     relationship_type: free text, e.g. 'related', 'builds_on', 'contradicts', 'action_from'.
     note: optional explanation of the connection.
     """
-    return (
-        supabase.table("idea_relationships")
-        .insert(
-            {
-                "source_id": source_id,
-                "target_id": target_id,
-                "relationship_type": relationship_type,
-                "note": note,
-            }
+    log.info("TOOL CALL: link_ideas(source=%r, target=%r, type=%r)", source_id, target_id, relationship_type)
+    try:
+        result = (
+            supabase.table("idea_relationships")
+            .insert(
+                {
+                    "source_id": source_id,
+                    "target_id": target_id,
+                    "relationship_type": relationship_type,
+                    "note": note,
+                }
+            )
+            .execute()
+            .data[0]
         )
-        .execute()
-        .data[0]
-    )
+        log.info("  -> linked ideas")
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
@@ -267,33 +363,47 @@ def get_related_ideas(idea_id: str) -> list:
 
     Returns the relationship record with the linked idea embedded.
     """
-    fwd = (
-        supabase.table("idea_relationships")
-        .select("*, target:target_id(*)")
-        .eq("source_id", idea_id)
-        .execute()
-        .data
-    )
-    rev = (
-        supabase.table("idea_relationships")
-        .select("*, source:source_id(*)")
-        .eq("target_id", idea_id)
-        .execute()
-        .data
-    )
-    return fwd + rev
+    log.info("TOOL CALL: get_related_ideas(id=%r)", idea_id)
+    try:
+        fwd = (
+            supabase.table("idea_relationships")
+            .select("*, target:target_id(*)")
+            .eq("source_id", idea_id)
+            .execute()
+            .data
+        )
+        rev = (
+            supabase.table("idea_relationships")
+            .select("*, source:source_id(*)")
+            .eq("target_id", idea_id)
+            .execute()
+            .data
+        )
+        results = fwd + rev
+        log.info("  -> returned %d relationships", len(results))
+        return results
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
 def remove_relationship(relationship_id: str) -> dict:
     """Remove a link between two ideas."""
-    return (
-        supabase.table("idea_relationships")
-        .delete()
-        .eq("id", relationship_id)
-        .execute()
-        .data
-    )
+    log.info("TOOL CALL: remove_relationship(id=%r)", relationship_id)
+    try:
+        result = (
+            supabase.table("idea_relationships")
+            .delete()
+            .eq("id", relationship_id)
+            .execute()
+            .data
+        )
+        log.info("  -> removed relationship")
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -316,17 +426,24 @@ def add_insight(
     category (optional): one of groceries, religious_study, finance_journal, product_ideas, health_wellness, cf_care, cooking_recipes, business_learning
     action_item: a concrete next step Cole should consider.
     """
-    data = {
-        "title": title,
-        "summary": summary,
-        "related_idea_ids": related_idea_ids or [],
-        "tags": tags or [],
-    }
-    if category:
-        data["category"] = category
-    if action_item:
-        data["action_item"] = action_item
-    return supabase.table("insights").insert(data).execute().data[0]
+    log.info("TOOL CALL: add_insight(title=%r, category=%r)", title, category)
+    try:
+        data = {
+            "title": title,
+            "summary": summary,
+            "related_idea_ids": related_idea_ids or [],
+            "tags": tags or [],
+        }
+        if category:
+            data["category"] = category
+        if action_item:
+            data["action_item"] = action_item
+        result = supabase.table("insights").insert(data).execute().data[0]
+        log.info("  -> created insight %s", result.get("id"))
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
@@ -336,24 +453,38 @@ def list_insights(category: str | None = None, unactioned_only: bool = False) ->
     category: one of groceries, religious_study, finance_journal, product_ideas, health_wellness, cf_care, cooking_recipes, business_learning
     unactioned_only: if true, only show insights with pending action items.
     """
-    q = supabase.table("insights").select("*")
-    if category:
-        q = q.eq("category", category)
-    if unactioned_only:
-        q = q.eq("is_actioned", False)
-    return q.order("created_at", desc=True).execute().data
+    log.info("TOOL CALL: list_insights(category=%r, unactioned_only=%r)", category, unactioned_only)
+    try:
+        q = supabase.table("insights").select("*")
+        if category:
+            q = q.eq("category", category)
+        if unactioned_only:
+            q = q.eq("is_actioned", False)
+        results = q.order("created_at", desc=True).execute().data
+        log.info("  -> returned %d insights", len(results))
+        return results
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 @mcp.tool()
 def mark_actioned(insight_id: str) -> dict:
     """Mark an insight's action item as completed."""
-    return (
-        supabase.table("insights")
-        .update({"is_actioned": True})
-        .eq("id", insight_id)
-        .execute()
-        .data[0]
-    )
+    log.info("TOOL CALL: mark_actioned(id=%r)", insight_id)
+    try:
+        result = (
+            supabase.table("insights")
+            .update({"is_actioned": True})
+            .eq("id", insight_id)
+            .execute()
+            .data[0]
+        )
+        log.info("  -> marked insight as actioned")
+        return result
+    except Exception as e:
+        log.error("  -> FAILED: %s\n%s", e, traceback.format_exc())
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -362,4 +493,11 @@ def mark_actioned(insight_id: str) -> dict:
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 8000))
-    mcp.run(transport="streamable-http", host="0.0.0.0", port=port)
+    log.info("Starting Second Brain MCP on port %s (stateless mode)", port)
+    mcp.run(
+        transport="streamable-http",
+        host="0.0.0.0",
+        port=port,
+        path="/mcp",
+        stateless_http=True,
+    )
